@@ -46,3 +46,15 @@ pub struct RunQuery {
     #[serde(rename = "useLegacySql")]
     pub use_legacy_sql: bool,
 }
+
+#[derive(Debug, Clone)]
+pub struct DatasetInfo {
+    pub id: String,
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatasetPage {
+    pub datasets: Vec<DatasetInfo>,
+    pub next_page_token: Option<String>,
+}

@@ -17,8 +17,8 @@ async fn test_create_dataset() {
     let result = client.create_dataset("test_create_ds").await;
     client.delete_dataset("test_create_ds", true).await.ok();
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 200);
+    let info = result.unwrap();
+    assert_eq!(info.id, "test_create_ds");
 }
 
 #[tokio::test]
@@ -28,18 +28,14 @@ async fn test_delete_dataset() {
     client.create_dataset("test_delete_ds").await.ok();
     let result = client.delete_dataset("test_delete_ds", true).await;
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 204);
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_list_datasets() {
     let client = create_client().await;
-    let result = client.list_datasets().await;
+    let result = client.list_datasets(None, None).await;
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 200);
 }
 
 #[tokio::test]

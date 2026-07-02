@@ -1,15 +1,15 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::{header::AUTHORIZATION, Client};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::errors::CloudError;
 use crate::gcp::gcp_apis::auth::gcp_auth::ServiceAccountTokenProvider;
 use crate::gcp::types::database::gcp_bigquery_types::*;
 use crate::traits::token_provider::TokenProvider;
-use std::path::PathBuf;
 
 struct CachedToken {
     value: String,
@@ -74,7 +74,7 @@ impl BigQuery {
         Ok(cached.value.clone())
     }
 
-    pub async fn create_dataset(&self, dataset_id: &str) -> Result<serde_json::Value, CloudError> {
+    pub async fn create_dataset(&self, dataset_id: &str) -> Result<DatasetInfo, CloudError> {
         let url = bigquery_url(&self.project_id, "datasets");
         let body = CreateDataset {
             dataset_reference: DatasetReference {
@@ -88,7 +88,7 @@ impl BigQuery {
             .client
             .post(&url)
             .json(&body)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -99,14 +99,15 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        let resp: Value = serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })?;
+        parse_dataset_info(&resp)
     }
 
     pub async fn delete_dataset(
         &self,
         dataset_id: &str,
         delete_contents: bool,
-    ) -> Result<serde_json::Value, CloudError> {
+    ) -> Result<(), CloudError> {
         let url = format!(
             "{}?deleteContents={}",
             bigquery_url(&self.project_id, &format!("datasets/{}", dataset_id)),
@@ -117,7 +118,7 @@ impl BigQuery {
         let response = self
             .client
             .delete(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -128,17 +129,33 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        Ok(())
     }
 
-    pub async fn list_datasets(&self) -> Result<serde_json::Value, CloudError> {
-        let url = bigquery_url(&self.project_id, "datasets");
-        let token = self.get_token().await?;
+    pub async fn list_datasets(
+        &self,
+        page_token: Option<&str>,
+        max_results: Option<u32>,
+    ) -> Result<DatasetPage, CloudError> {
+        let base = bigquery_url(&self.project_id, "datasets");
+        let mut params: Vec<String> = Vec::new();
+        if let Some(pt) = page_token {
+            params.push(format!("pageToken={}", pt));
+        }
+        if let Some(mr) = max_results {
+            params.push(format!("maxResults={}", mr));
+        }
+        let url = if params.is_empty() {
+            base
+        } else {
+            format!("{}?{}", base, params.join("&"))
+        };
 
+        let token = self.get_token().await?;
         let response = self
             .client
             .get(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -149,7 +166,8 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        let resp: Value = serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })?;
+        parse_dataset_list(&resp)
     }
 
     pub async fn create_table(
@@ -173,7 +191,7 @@ impl BigQuery {
             .client
             .post(&url)
             .json(&body)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -201,7 +219,7 @@ impl BigQuery {
         let response = self
             .client
             .delete(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -222,7 +240,7 @@ impl BigQuery {
         let response = self
             .client
             .get(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -248,7 +266,7 @@ impl BigQuery {
             .client
             .post(&url)
             .json(&body)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, bearer(&token))
             .send()
             .await
             .map_err(|e| CloudError::Network { source: e })?;
@@ -261,6 +279,10 @@ impl BigQuery {
 
         Ok(json!({ "status": status, "body": text }))
     }
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {}", token)
 }
 
 pub(crate) fn bigquery_url(project_id: &str, path: &str) -> String {
@@ -287,6 +309,35 @@ pub(crate) fn map_bigquery_http_error(status: u16, body: &str) -> CloudError {
             retryable: status >= 500,
         },
     }
+}
+
+pub(crate) fn parse_dataset_info(json: &Value) -> Result<DatasetInfo, CloudError> {
+    let id = json["datasetReference"]["datasetId"]
+        .as_str()
+        .ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: dataset id missing from response".to_string(),
+            retryable: false,
+        })?
+        .to_string();
+    let project_id = json["datasetReference"]["projectId"]
+        .as_str()
+        .ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: project id missing from response".to_string(),
+            retryable: false,
+        })?
+        .to_string();
+    Ok(DatasetInfo { id, project_id })
+}
+
+pub(crate) fn parse_dataset_list(json: &Value) -> Result<DatasetPage, CloudError> {
+    let datasets = match json["datasets"].as_array() {
+        Some(arr) => arr.iter().map(parse_dataset_info).collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+    let next_page_token = json["nextPageToken"].as_str().map(str::to_owned);
+    Ok(DatasetPage { datasets, next_page_token })
 }
 
 #[cfg(test)]
@@ -370,5 +421,71 @@ mod unit_tests {
         let bq = no_creds_bigquery();
         let token = bq.get_token().await.unwrap();
         assert_eq!(token, "test-token");
+    }
+
+    #[test]
+    fn test_parse_dataset_info_valid() {
+        let json = serde_json::json!({
+            "datasetReference": { "datasetId": "my_ds", "projectId": "my-project" }
+        });
+        let info = parse_dataset_info(&json).unwrap();
+        assert_eq!(info.id, "my_ds");
+        assert_eq!(info.project_id, "my-project");
+    }
+
+    #[test]
+    fn test_parse_dataset_info_missing_dataset_id() {
+        let json = serde_json::json!({ "datasetReference": { "projectId": "my-project" } });
+        assert!(parse_dataset_info(&json).is_err());
+    }
+
+    #[test]
+    fn test_parse_dataset_info_missing_project_id() {
+        let json = serde_json::json!({ "datasetReference": { "datasetId": "my_ds" } });
+        assert!(parse_dataset_info(&json).is_err());
+    }
+
+    #[test]
+    fn test_parse_dataset_list_empty_array() {
+        let json = serde_json::json!({ "datasets": [] });
+        let page = parse_dataset_list(&json).unwrap();
+        assert!(page.datasets.is_empty());
+        assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_dataset_list_no_datasets_key() {
+        let json = serde_json::json!({});
+        let page = parse_dataset_list(&json).unwrap();
+        assert!(page.datasets.is_empty());
+        assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_dataset_list_with_next_token() {
+        let json = serde_json::json!({
+            "datasets": [
+                { "datasetReference": { "datasetId": "ds1", "projectId": "proj" } }
+            ],
+            "nextPageToken": "abc123"
+        });
+        let page = parse_dataset_list(&json).unwrap();
+        assert_eq!(page.datasets.len(), 1);
+        assert_eq!(page.datasets[0].id, "ds1");
+        assert_eq!(page.next_page_token, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_dataset_list_without_next_token() {
+        let json = serde_json::json!({
+            "datasets": [
+                { "datasetReference": { "datasetId": "ds1", "projectId": "proj" } },
+                { "datasetReference": { "datasetId": "ds2", "projectId": "proj" } }
+            ]
+        });
+        let page = parse_dataset_list(&json).unwrap();
+        assert_eq!(page.datasets.len(), 2);
+        assert_eq!(page.datasets[1].id, "ds2");
+        assert!(page.next_page_token.is_none());
     }
 }
