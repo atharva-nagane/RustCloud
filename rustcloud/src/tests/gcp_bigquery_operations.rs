@@ -47,10 +47,12 @@ async fn test_create_table() {
         TableField {
             name: "id".to_string(),
             field_type: "INTEGER".to_string(),
+            mode: None,
         },
         TableField {
             name: "name".to_string(),
             field_type: "STRING".to_string(),
+            mode: Some("NULLABLE".to_string()),
         },
     ];
     let result = client
@@ -58,8 +60,8 @@ async fn test_create_table() {
         .await;
     client.delete_dataset("test_create_table_ds", true).await.ok();
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 200);
+    let info = result.unwrap();
+    assert_eq!(info.id, "test_tbl");
 }
 
 #[tokio::test]
@@ -70,13 +72,12 @@ async fn test_delete_table() {
     let fields = vec![TableField {
         name: "id".to_string(),
         field_type: "INTEGER".to_string(),
+        mode: None,
     }];
     client.create_table("test_delete_table_ds", "test_tbl", fields).await.ok();
     let result = client.delete_table("test_delete_table_ds", "test_tbl").await;
     client.delete_dataset("test_delete_table_ds", true).await.ok();
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 204);
 }
 
 #[tokio::test]
@@ -84,11 +85,9 @@ async fn test_delete_table() {
 async fn test_list_tables() {
     let client = create_client().await;
     client.create_dataset("test_list_tables_ds").await.ok();
-    let result = client.list_tables("test_list_tables_ds").await;
+    let result = client.list_tables("test_list_tables_ds", None, None).await;
     client.delete_dataset("test_list_tables_ds", true).await.ok();
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 200);
 }
 
 #[tokio::test]
@@ -97,6 +96,7 @@ async fn test_run_query() {
     let client = create_client().await;
     let result = client.run_query("SELECT 1").await;
     assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response["status"], 200);
+    let job_id = result.unwrap();
+    let query_result = client.get_query_results(&job_id).await;
+    assert!(query_result.is_ok());
 }

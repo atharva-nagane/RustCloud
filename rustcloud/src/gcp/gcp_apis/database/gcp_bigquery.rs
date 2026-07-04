@@ -175,7 +175,7 @@ impl BigQuery {
         dataset_id: &str,
         table_id: &str,
         fields: Vec<TableField>,
-    ) -> Result<serde_json::Value, CloudError> {
+    ) -> Result<TableInfo, CloudError> {
         let url = bigquery_url(&self.project_id, &format!("datasets/{}/tables", dataset_id));
         let body = CreateTable {
             table_reference: TableReference {
@@ -202,14 +202,15 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        let resp: Value = serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })?;
+        parse_table_info(&resp)
     }
 
     pub async fn delete_table(
         &self,
         dataset_id: &str,
         table_id: &str,
-    ) -> Result<serde_json::Value, CloudError> {
+    ) -> Result<(), CloudError> {
         let url = bigquery_url(
             &self.project_id,
             &format!("datasets/{}/tables/{}", dataset_id, table_id),
@@ -230,13 +231,30 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        Ok(())
     }
 
-    pub async fn list_tables(&self, dataset_id: &str) -> Result<serde_json::Value, CloudError> {
-        let url = bigquery_url(&self.project_id, &format!("datasets/{}/tables", dataset_id));
-        let token = self.get_token().await?;
+    pub async fn list_tables(
+        &self,
+        dataset_id: &str,
+        page_token: Option<&str>,
+        max_results: Option<u32>,
+    ) -> Result<TablePage, CloudError> {
+        let base = bigquery_url(&self.project_id, &format!("datasets/{}/tables", dataset_id));
+        let mut params: Vec<String> = Vec::new();
+        if let Some(pt) = page_token {
+            params.push(format!("pageToken={}", pt));
+        }
+        if let Some(mr) = max_results {
+            params.push(format!("maxResults={}", mr));
+        }
+        let url = if params.is_empty() {
+            base
+        } else {
+            format!("{}?{}", base, params.join("&"))
+        };
 
+        let token = self.get_token().await?;
         let response = self
             .client
             .get(&url)
@@ -251,10 +269,11 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        let resp: Value = serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })?;
+        parse_table_list(&resp)
     }
 
-    pub async fn run_query(&self, query: &str) -> Result<serde_json::Value, CloudError> {
+    pub async fn run_query(&self, query: &str) -> Result<String, CloudError> {
         let url = bigquery_url(&self.project_id, "queries");
         let body = RunQuery {
             query: query.to_string(),
@@ -277,7 +296,99 @@ impl BigQuery {
             return Err(map_bigquery_http_error(status, &text));
         }
 
-        Ok(json!({ "status": status, "body": text }))
+        let resp: Value = serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })?;
+        parse_job_id(&resp)
+    }
+
+    pub async fn get_query_results(&self, job_id: &str) -> Result<QueryResult, CloudError> {
+        for attempt in 0..60 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let resp = self.fetch_query_results(job_id).await?;
+            if resp["jobComplete"].as_bool().unwrap_or(false) {
+                return parse_query_result(&resp);
+            }
+        }
+        Err(CloudError::Provider {
+            http_status: 0,
+            message: "query did not complete within 60 seconds".to_string(),
+            retryable: true,
+        })
+    }
+
+    pub(crate) async fn fetch_query_results(&self, job_id: &str) -> Result<Value, CloudError> {
+        let url = bigquery_url(&self.project_id, &format!("queries/{}", job_id));
+        let token = self.get_token().await?;
+
+        let response = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, bearer(&token))
+            .send()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let status = response.status().as_u16();
+        let text = response.text().await.map_err(|e| CloudError::Network { source: e })?;
+        if status >= 400 {
+            return Err(map_bigquery_http_error(status, &text));
+        }
+
+        serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })
+    }
+
+    pub async fn insert_rows(
+        &self,
+        dataset_id: &str,
+        table_id: &str,
+        rows: Vec<Value>,
+    ) -> Result<(), CloudError> {
+        let url = bigquery_url(
+            &self.project_id,
+            &format!("datasets/{}/tables/{}/insertAll", dataset_id, table_id),
+        );
+        let body = json!({
+            "rows": rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, row)| json!({ "insertId": i.to_string(), "json": row }))
+                .collect::<Vec<_>>()
+        });
+        let token = self.get_token().await?;
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .header(AUTHORIZATION, bearer(&token))
+            .send()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let status = response.status().as_u16();
+        let text = response.text().await.map_err(|e| CloudError::Network { source: e })?;
+        if status >= 400 {
+            return Err(map_bigquery_http_error(status, &text));
+        }
+
+        let resp: Value = serde_json::from_str(&text).map_err(|e| CloudError::Serialization { source: e })?;
+        if let Some(errors) = resp["insertErrors"].as_array() {
+            if !errors.is_empty() {
+                let msg = errors[0]["errors"]
+                    .as_array()
+                    .and_then(|e| e.first())
+                    .and_then(|e| e["message"].as_str())
+                    .unwrap_or("streaming insert failed")
+                    .to_string();
+                return Err(CloudError::Provider {
+                    http_status: 200,
+                    message: msg,
+                    retryable: false,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -338,6 +449,55 @@ pub(crate) fn parse_dataset_list(json: &Value) -> Result<DatasetPage, CloudError
     };
     let next_page_token = json["nextPageToken"].as_str().map(str::to_owned);
     Ok(DatasetPage { datasets, next_page_token })
+}
+
+pub(crate) fn parse_table_info(json: &Value) -> Result<TableInfo, CloudError> {
+    let id = json["tableReference"]["tableId"]
+        .as_str()
+        .ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: table id missing from response".to_string(),
+            retryable: false,
+        })?
+        .to_string();
+    let dataset_id = json["tableReference"]["datasetId"]
+        .as_str()
+        .ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: dataset id missing from table response".to_string(),
+            retryable: false,
+        })?
+        .to_string();
+    Ok(TableInfo { id, dataset_id })
+}
+
+pub(crate) fn parse_table_list(json: &Value) -> Result<TablePage, CloudError> {
+    let tables = match json["tables"].as_array() {
+        Some(arr) => arr.iter().map(parse_table_info).collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+    let next_page_token = json["nextPageToken"].as_str().map(str::to_owned);
+    Ok(TablePage { tables, next_page_token })
+}
+
+pub(crate) fn parse_job_id(json: &Value) -> Result<String, CloudError> {
+    json["jobReference"]["jobId"]
+        .as_str()
+        .ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: job id missing from response".to_string(),
+            retryable: false,
+        })
+        .map(str::to_owned)
+}
+
+pub(crate) fn parse_query_result(json: &Value) -> Result<QueryResult, CloudError> {
+    let rows = match json["rows"].as_array() {
+        Some(arr) => arr.to_vec(),
+        None => Vec::new(),
+    };
+    let total_rows = json["totalRows"].as_str().and_then(|s| s.parse::<u64>().ok());
+    Ok(QueryResult { rows, total_rows })
 }
 
 #[cfg(test)]
@@ -487,5 +647,117 @@ mod unit_tests {
         assert_eq!(page.datasets.len(), 2);
         assert_eq!(page.datasets[1].id, "ds2");
         assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_table_info_valid() {
+        let json = serde_json::json!({
+            "tableReference": { "tableId": "my_tbl", "datasetId": "my_ds", "projectId": "proj" }
+        });
+        let info = parse_table_info(&json).unwrap();
+        assert_eq!(info.id, "my_tbl");
+        assert_eq!(info.dataset_id, "my_ds");
+    }
+
+    #[test]
+    fn test_parse_table_info_missing_table_id() {
+        let json = serde_json::json!({ "tableReference": { "datasetId": "my_ds" } });
+        assert!(parse_table_info(&json).is_err());
+    }
+
+    #[test]
+    fn test_parse_table_info_missing_dataset_id() {
+        let json = serde_json::json!({ "tableReference": { "tableId": "my_tbl" } });
+        assert!(parse_table_info(&json).is_err());
+    }
+
+    #[test]
+    fn test_parse_table_list_empty() {
+        let json = serde_json::json!({});
+        let page = parse_table_list(&json).unwrap();
+        assert!(page.tables.is_empty());
+        assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_table_list_with_next_token() {
+        let json = serde_json::json!({
+            "tables": [
+                { "tableReference": { "tableId": "tbl1", "datasetId": "ds1", "projectId": "proj" } }
+            ],
+            "nextPageToken": "tok123"
+        });
+        let page = parse_table_list(&json).unwrap();
+        assert_eq!(page.tables.len(), 1);
+        assert_eq!(page.tables[0].id, "tbl1");
+        assert_eq!(page.next_page_token, Some("tok123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_table_list_without_next_token() {
+        let json = serde_json::json!({
+            "tables": [
+                { "tableReference": { "tableId": "tbl1", "datasetId": "ds1", "projectId": "proj" } },
+                { "tableReference": { "tableId": "tbl2", "datasetId": "ds1", "projectId": "proj" } }
+            ]
+        });
+        let page = parse_table_list(&json).unwrap();
+        assert_eq!(page.tables.len(), 2);
+        assert_eq!(page.tables[1].id, "tbl2");
+        assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_job_id_valid() {
+        let json = serde_json::json!({ "jobReference": { "jobId": "job_abc", "projectId": "proj" } });
+        let id = parse_job_id(&json).unwrap();
+        assert_eq!(id, "job_abc");
+    }
+
+    #[test]
+    fn test_parse_job_id_missing_returns_error() {
+        let json = serde_json::json!({ "jobReference": {} });
+        assert!(parse_job_id(&json).is_err());
+    }
+
+    #[test]
+    fn test_parse_query_result_valid() {
+        let json = serde_json::json!({
+            "rows": [
+                { "f": [{ "v": "hello" }] },
+                { "f": [{ "v": "world" }] }
+            ],
+            "totalRows": "2",
+            "jobComplete": true
+        });
+        let result = parse_query_result(&json).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.total_rows, Some(2));
+        assert_eq!(result.rows[0]["f"][0]["v"], "hello");
+    }
+
+    #[test]
+    fn test_parse_query_result_empty_rows() {
+        let json = serde_json::json!({ "jobComplete": true, "totalRows": "0" });
+        let result = parse_query_result(&json).unwrap();
+        assert!(result.rows.is_empty());
+        assert_eq!(result.total_rows, Some(0));
+    }
+
+    #[test]
+    fn test_insert_rows_request_body() {
+        // Verifies the expected wire shape: each row wrapped with a string insertId and a "json" key.
+        let expected = serde_json::json!({
+            "rows": [
+                { "insertId": "0", "json": { "name": "Alice", "age": 30 } },
+                { "insertId": "1", "json": { "name": "Bob",   "age": 25 } }
+            ]
+        });
+        let rows_arr = expected["rows"].as_array().unwrap();
+        assert_eq!(rows_arr.len(), 2);
+        assert_eq!(rows_arr[0]["insertId"], "0");
+        assert_eq!(rows_arr[0]["json"]["name"], "Alice");
+        assert_eq!(rows_arr[1]["insertId"], "1");
+        assert_eq!(rows_arr[1]["json"]["age"], 25);
     }
 }
