@@ -3,18 +3,25 @@ use futures::StreamExt;
 use crate::azure::azure_apis::artificial_intelligence::azure_openai::{
     AzureOpenAiProvider,
     build_chat_request,
+    build_embed_request,
+    build_tool_request,
     drain_complete_lines,
     extract_deployment_name,
     is_reasoning_model,
     map_azure_http_error,
     map_finish_reason,
     parse_chat_response,
+    parse_embed_response,
     parse_sse_line,
+    parse_tool_response,
     pump_stream,
     sse_chunk_to_events,
 };
 use crate::errors::CloudError;
-use crate::types::llm::{FinishReason, LlmRequest, LlmStreamEvent, Message, ModelRef};
+use crate::traits::llm_provider::LlmProvider;
+use crate::types::llm::{
+    FinishReason, LlmRequest, LlmStreamEvent, Message, ModelRef, ToolCallResponse, ToolDefinition,
+};
 
 fn no_creds_provider() -> AzureOpenAiProvider {
     AzureOpenAiProvider::with_http_client(
@@ -353,6 +360,19 @@ fn test_sse_chunk_error_object() {
     ));
 }
 
+#[test]
+fn test_sse_chunk_error_object_without_message() {
+    let json = serde_json::json!({
+        "error": { "code": "content_filter" }
+    });
+    let events = sse_chunk_to_events(&json);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        LlmStreamEvent::Error(CloudError::Provider { http_status: 200, .. })
+    ));
+}
+
 // --- drain_complete_lines ---
 
 #[test]
@@ -485,6 +505,256 @@ async fn test_stream_orders_usage_before_done_across_separate_chunks() {
     assert!(matches!(&events[1], LlmStreamEvent::Done(FinishReason::Stop)));
 }
 
+// --- build_embed_request ---
+
+#[test]
+fn test_build_embed_request() {
+    let texts = vec!["hello".to_string(), "world".to_string()];
+    let body = build_embed_request(&texts);
+    assert_eq!(body["input"], serde_json::json!(["hello", "world"]));
+}
+
+// --- parse_embed_response ---
+
+#[test]
+fn test_parse_embed_response_valid() {
+    let json = serde_json::json!({
+        "data": [
+            { "index": 0, "embedding": [0.1, 0.2] },
+            { "index": 1, "embedding": [0.3, 0.4] }
+        ]
+    });
+    let resp = parse_embed_response(&json).unwrap();
+    assert_eq!(resp.embeddings, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+}
+
+#[test]
+fn test_parse_embed_response_reorders_by_index() {
+    let json = serde_json::json!({
+        "data": [
+            { "index": 1, "embedding": [0.3, 0.4] },
+            { "index": 0, "embedding": [0.1, 0.2] }
+        ]
+    });
+    let resp = parse_embed_response(&json).unwrap();
+    assert_eq!(resp.embeddings, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+}
+
+#[test]
+fn test_parse_embed_response_missing_data_key() {
+    let json = serde_json::json!({});
+    let err = parse_embed_response(&json).unwrap_err();
+    assert!(matches!(err, CloudError::Provider { http_status: 0, .. }));
+}
+
+#[test]
+fn test_parse_embed_response_missing_index_is_error() {
+    let json = serde_json::json!({
+        "data": [
+            { "embedding": [0.1, 0.2] },
+            { "index": 1, "embedding": [0.3, 0.4] }
+        ]
+    });
+    let err = parse_embed_response(&json).unwrap_err();
+    assert!(matches!(err, CloudError::Provider { http_status: 0, .. }));
+}
+
+#[test]
+fn test_parse_embed_response_duplicate_index_is_error() {
+    let json = serde_json::json!({
+        "data": [
+            { "index": 0, "embedding": [0.1, 0.2] },
+            { "index": 0, "embedding": [0.3, 0.4] }
+        ]
+    });
+    let err = parse_embed_response(&json).unwrap_err();
+    assert!(matches!(err, CloudError::Provider { http_status: 0, .. }));
+}
+
+#[test]
+fn test_parse_embed_response_out_of_range_index_is_error() {
+    let json = serde_json::json!({
+        "data": [
+            { "index": 5, "embedding": [0.1, 0.2] }
+        ]
+    });
+    let err = parse_embed_response(&json).unwrap_err();
+    assert!(matches!(err, CloudError::Provider { http_status: 0, .. }));
+}
+
+// --- embed (no live credentials) ---
+
+#[tokio::test]
+async fn test_embed_empty_input_no_http_call() {
+    let provider = no_creds_provider();
+    let resp = provider.embed(vec![]).await.unwrap();
+    assert!(resp.embeddings.is_empty());
+}
+
+// --- build_tool_request ---
+
+fn make_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "get_weather".to_string(),
+        description: "Gets the weather for a city".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        }),
+    }
+}
+
+#[test]
+fn test_build_tool_request_shape() {
+    let req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![Message { role: "user".to_string(), content: "weather in Pune?".to_string() }],
+    );
+    let body = build_tool_request(&req, "gpt-4o", &[make_tool()]);
+
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(
+        body["tools"][0]["function"]["description"],
+        "Gets the weather for a city"
+    );
+    assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+}
+
+#[test]
+fn test_build_tool_request_disables_parallel_tool_calls() {
+    let req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![Message { role: "user".to_string(), content: "weather in Pune?".to_string() }],
+    );
+    let body = build_tool_request(&req, "gpt-4o", &[make_tool()]);
+    assert_eq!(body["parallel_tool_calls"], false);
+}
+
+#[test]
+fn test_build_tool_request_empty_tools_omits_key() {
+    let req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![Message { role: "user".to_string(), content: "hi".to_string() }],
+    );
+    let body = build_tool_request(&req, "gpt-4o", &[]);
+    assert!(body["tools"].is_null());
+    assert!(body["tool_choice"].is_null());
+}
+
+#[test]
+fn test_build_tool_request_preserves_chat_fields() {
+    let mut req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![Message { role: "user".to_string(), content: "weather in Pune?".to_string() }],
+    );
+    req.max_tokens = Some(128);
+    req.system_prompt = Some("You are terse.".to_string());
+    let body = build_tool_request(&req, "gpt-4o", &[make_tool()]);
+
+    assert_eq!(body["max_tokens"], 128);
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][1]["content"], "weather in Pune?");
+}
+
+// --- parse_tool_response ---
+
+#[test]
+fn test_parse_tool_response_parses_stringified_arguments() {
+    let json = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Pune\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let resp = parse_tool_response(&json).unwrap();
+    match resp {
+        ToolCallResponse::ToolCall { name, arguments } => {
+            assert_eq!(name, "get_weather");
+            assert_eq!(arguments["city"], "Pune");
+        }
+        other => panic!("expected ToolCall, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_tool_response_malformed_arguments_string() {
+    let json = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "not-json"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let err = parse_tool_response(&json).unwrap_err();
+    assert!(matches!(err, CloudError::Provider { http_status: 0, .. }));
+}
+
+#[test]
+fn test_parse_tool_response_text_fallback() {
+    let json = serde_json::json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "It's sunny." },
+            "finish_reason": "stop"
+        }]
+    });
+    let resp = parse_tool_response(&json).unwrap();
+    match resp {
+        ToolCallResponse::Text(inner) => assert_eq!(inner.text, "It's sunny."),
+        other => panic!("expected Text, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_tool_call_undefined_tool() {
+    let json = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "function": {
+                        "name": "some_tool_not_in_request",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let resp = parse_tool_response(&json).unwrap();
+    assert!(matches!(resp, ToolCallResponse::ToolCall { name, .. } if name == "some_tool_not_in_request"));
+}
+
+// --- generate_with_tools (no live credentials) ---
+
+#[tokio::test]
+async fn test_generate_with_tools_rejects_empty_tools() {
+    let provider = no_creds_provider();
+    let req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![Message { role: "user".to_string(), content: "hi".to_string() }],
+    );
+    let err = provider.generate_with_tools(req, vec![]).await.unwrap_err();
+    assert!(matches!(err, CloudError::Unsupported { .. }));
+}
+
 // --- integration tests (require live Azure OpenAI credentials, run with --ignored) ---
 
 #[tokio::test]
@@ -523,4 +793,46 @@ async fn test_stream_live() {
         }
     }
     assert!(got_text);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_embed_live() {
+    let provider = AzureOpenAiProvider::new().expect("failed to create provider");
+    let resp = provider
+        .embed(vec!["hello world".to_string()])
+        .await
+        .expect("embed failed");
+    assert_eq!(resp.embeddings.len(), 1);
+    assert!(!resp.embeddings[0].is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_generate_with_tools_live() {
+    let provider = AzureOpenAiProvider::new().expect("failed to create provider");
+    let req = LlmRequest {
+        model: ModelRef::Deployment("gpt-4o".to_string()),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: "What's the weather in Pune?".to_string(),
+        }],
+        max_tokens: Some(64),
+        temperature: Some(0.0),
+        system_prompt: None,
+    };
+    let tools = vec![ToolDefinition {
+        name: "get_weather".to_string(),
+        description: "Gets the weather for a city".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        }),
+    }];
+    let resp = provider
+        .generate_with_tools(req, tools)
+        .await
+        .expect("generate_with_tools failed");
+    assert!(matches!(resp, ToolCallResponse::ToolCall { .. }));
 }

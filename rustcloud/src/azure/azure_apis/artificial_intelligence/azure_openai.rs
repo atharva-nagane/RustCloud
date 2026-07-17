@@ -1,10 +1,12 @@
+use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::SinkExt;
 
 use crate::errors::CloudError;
-use crate::traits::llm_provider::LlmStream;
+use crate::traits::llm_provider::{LlmProvider, LlmStream};
 use crate::types::llm::{
-    FinishReason, LlmRequest, LlmResponse, LlmStreamEvent, ModelRef, UsageStats,
+    EmbedResponse, FinishReason, LlmRequest, LlmResponse, LlmStreamEvent, ModelRef,
+    ToolCallResponse, ToolDefinition, UsageStats,
 };
 
 pub struct AzureOpenAiProvider {
@@ -62,61 +64,6 @@ impl AzureOpenAiProvider {
     pub(crate) fn request(&self, url: &str) -> reqwest::RequestBuilder {
         self.client.post(url).header("api-key", self.api_key.as_str())
     }
-
-    pub async fn generate(&self, req: LlmRequest) -> Result<LlmResponse, CloudError> {
-        let deployment = extract_deployment_name(&req.model)?;
-        let url = self.azure_endpoint(&deployment, "chat/completions");
-        let body = build_chat_request(&req, &deployment);
-
-        let response = self
-            .request(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CloudError::Network { source: e })?;
-
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let text = response.text().await.unwrap_or_default();
-            return Err(map_azure_http_error(status, &text));
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| CloudError::Network { source: e })?;
-
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| CloudError::Serialization { source: e })?;
-
-        parse_chat_response(&resp_json)
-    }
-
-    pub async fn stream(&self, req: LlmRequest) -> Result<LlmStream, CloudError> {
-        let deployment = extract_deployment_name(&req.model)?;
-        let url = self.azure_endpoint(&deployment, "chat/completions");
-        let mut body = build_chat_request(&req, &deployment);
-        body["stream"] = serde_json::json!(true);
-        body["stream_options"] = serde_json::json!({ "include_usage": true });
-
-        let response = self
-            .request(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CloudError::Network { source: e })?;
-
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let text = response.text().await.unwrap_or_default();
-            return Err(map_azure_http_error(status, &text));
-        }
-
-        let (tx, rx) = mpsc::channel::<LlmStreamEvent>(32);
-        tokio::spawn(pump_stream(response, tx));
-
-        Ok(Box::pin(rx))
-    }
 }
 
 pub(crate) fn extract_deployment_name(model: &ModelRef) -> Result<String, CloudError> {
@@ -154,6 +101,40 @@ pub(crate) fn build_chat_request(req: &LlmRequest, deployment: &str) -> serde_js
         if let Some(temperature) = req.temperature {
             body["temperature"] = serde_json::json!(temperature);
         }
+    }
+
+    body
+}
+
+pub(crate) fn build_embed_request(texts: &[String]) -> serde_json::Value {
+    serde_json::json!({ "input": texts })
+}
+
+pub(crate) fn build_tool_request(
+    req: &LlmRequest,
+    deployment: &str,
+    tools: &[ToolDefinition],
+) -> serde_json::Value {
+    let mut body = build_chat_request(req, deployment);
+
+    if !tools.is_empty() {
+        let functions: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+            })
+            .collect();
+
+        body["tools"] = serde_json::json!(functions);
+        body["tool_choice"] = serde_json::json!("auto");
+        body["parallel_tool_calls"] = serde_json::json!(false);
     }
 
     body
@@ -218,6 +199,62 @@ pub(crate) fn parse_chat_response(json: &serde_json::Value) -> Result<LlmRespons
     Ok(LlmResponse { text, finish_reason, usage })
 }
 
+pub(crate) fn parse_embed_response(json: &serde_json::Value) -> Result<EmbedResponse, CloudError> {
+    let data = json["data"].as_array().ok_or_else(|| CloudError::Provider {
+        http_status: 0,
+        message: "parse error: response contained no data".to_string(),
+        retryable: false,
+    })?;
+
+    let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; data.len()];
+    for entry in data {
+        let index = entry["index"].as_u64().ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: embedding entry missing index".to_string(),
+            retryable: false,
+        })? as usize;
+        let values = entry["embedding"].as_array().ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: malformed embedding in response".to_string(),
+            retryable: false,
+        })?;
+        let slot = embeddings.get_mut(index).ok_or_else(|| CloudError::Provider {
+            http_status: 0,
+            message: "parse error: embedding index out of range".to_string(),
+            retryable: false,
+        })?;
+        if slot.is_some() {
+            return Err(CloudError::Provider {
+                http_status: 0,
+                message: "parse error: duplicate embedding index".to_string(),
+                retryable: false,
+            });
+        }
+        *slot = Some(values.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect());
+    }
+
+    let embeddings = embeddings.into_iter().map(Option::unwrap_or_default).collect();
+    Ok(EmbedResponse { embeddings })
+}
+
+pub(crate) fn parse_tool_response(json: &serde_json::Value) -> Result<ToolCallResponse, CloudError> {
+    let call = json["choices"].get(0).and_then(|c| c["message"]["tool_calls"].get(0));
+
+    let Some(call) = call else {
+        return parse_chat_response(json).map(ToolCallResponse::Text);
+    };
+
+    let name = call["function"]["name"].as_str().unwrap_or("").to_string();
+    let raw_args = call["function"]["arguments"].as_str().unwrap_or("");
+    let arguments = serde_json::from_str(raw_args).map_err(|e| CloudError::Provider {
+        http_status: 0,
+        message: format!("parse error: tool call arguments were not valid JSON: {e}"),
+        retryable: false,
+    })?;
+
+    Ok(ToolCallResponse::ToolCall { name, arguments })
+}
+
 pub(crate) fn parse_sse_line(line: &str) -> Option<serde_json::Value> {
     let data = line.strip_prefix("data: ")?;
     if data == "[DONE]" {
@@ -242,10 +279,14 @@ pub(crate) fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<serde_json::Valu
 pub(crate) fn sse_chunk_to_events(json: &serde_json::Value) -> Vec<LlmStreamEvent> {
     let mut events = Vec::new();
 
-    if let Some(message) = json["error"]["message"].as_str() {
+    if let Some(error) = json.get("error") {
+        let message = error["message"]
+            .as_str()
+            .unwrap_or("azure returned an error with no message")
+            .to_string();
         events.push(LlmStreamEvent::Error(CloudError::Provider {
             http_status: 200,
-            message: message.to_string(),
+            message,
             retryable: false,
         }));
         return events;
@@ -348,5 +389,134 @@ pub(crate) async fn pump_stream(mut response: reqwest::Response, mut tx: mpsc::S
                 break;
             }
         }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AzureOpenAiProvider {
+    async fn generate(&self, req: LlmRequest) -> Result<LlmResponse, CloudError> {
+        let deployment = extract_deployment_name(&req.model)?;
+        let url = self.azure_endpoint(&deployment, "chat/completions");
+        let body = build_chat_request(&req, &deployment);
+
+        let response = self
+            .request(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = response.text().await.unwrap_or_default();
+            return Err(map_azure_http_error(status, &text));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| CloudError::Serialization { source: e })?;
+
+        parse_chat_response(&resp_json)
+    }
+
+    async fn stream(&self, req: LlmRequest) -> Result<LlmStream, CloudError> {
+        let deployment = extract_deployment_name(&req.model)?;
+        let url = self.azure_endpoint(&deployment, "chat/completions");
+        let mut body = build_chat_request(&req, &deployment);
+        body["stream"] = serde_json::json!(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+
+        let response = self
+            .request(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = response.text().await.unwrap_or_default();
+            return Err(map_azure_http_error(status, &text));
+        }
+
+        let (tx, rx) = mpsc::channel::<LlmStreamEvent>(32);
+        tokio::spawn(pump_stream(response, tx));
+
+        Ok(Box::pin(rx))
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<EmbedResponse, CloudError> {
+        if texts.is_empty() {
+            return Ok(EmbedResponse { embeddings: vec![] });
+        }
+
+        let url = self.azure_endpoint(&self.embed_deployment, "embeddings");
+        let body = build_embed_request(&texts);
+
+        let response = self
+            .request(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = response.text().await.unwrap_or_default();
+            return Err(map_azure_http_error(status, &text));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| CloudError::Serialization { source: e })?;
+
+        parse_embed_response(&resp_json)
+    }
+
+    async fn generate_with_tools(
+        &self,
+        req: LlmRequest,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<ToolCallResponse, CloudError> {
+        if tools.is_empty() {
+            return Err(CloudError::Unsupported {
+                feature: "generate_with_tools requires at least one tool",
+            });
+        }
+
+        let deployment = extract_deployment_name(&req.model)?;
+        let url = self.azure_endpoint(&deployment, "chat/completions");
+        let body = build_tool_request(&req, &deployment, &tools);
+
+        let response = self
+            .request(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = response.text().await.unwrap_or_default();
+            return Err(map_azure_http_error(status, &text));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CloudError::Network { source: e })?;
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| CloudError::Serialization { source: e })?;
+
+        parse_tool_response(&resp_json)
     }
 }
