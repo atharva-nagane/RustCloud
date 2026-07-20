@@ -10,11 +10,14 @@ use crate::azure::azure_apis::artificial_intelligence::azure_openai::{
     is_reasoning_model,
     map_azure_http_error,
     map_finish_reason,
+    parse_azure_error_message,
     parse_chat_response,
     parse_embed_response,
     parse_sse_line,
     parse_tool_response,
+    provider_error_from_response,
     pump_stream,
+    retry_after_seconds,
     sse_chunk_to_events,
 };
 use crate::errors::CloudError;
@@ -224,27 +227,79 @@ fn test_parse_chat_response_no_usage() {
     assert!(resp.usage.is_none());
 }
 
+// --- retry_after_seconds ---
+
+#[test]
+fn test_retry_after_seconds_parses_header() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+    assert_eq!(retry_after_seconds(&headers), Some(30));
+}
+
+#[test]
+fn test_retry_after_seconds_absent() {
+    let headers = reqwest::header::HeaderMap::new();
+    assert_eq!(retry_after_seconds(&headers), None);
+}
+
+#[test]
+fn test_retry_after_seconds_non_numeric_returns_none() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+    assert_eq!(retry_after_seconds(&headers), None);
+}
+
+// --- parse_azure_error_message ---
+
+#[test]
+fn test_parse_azure_error_message_extracts_field() {
+    let body = r#"{"error": {"code": "invalid_request", "message": "The api-key you provided is invalid."}}"#;
+    assert_eq!(parse_azure_error_message(body), "The api-key you provided is invalid.");
+}
+
+#[test]
+fn test_parse_azure_error_message_falls_back_on_non_json() {
+    assert_eq!(parse_azure_error_message("  not json at all  "), "not json at all");
+}
+
+#[test]
+fn test_parse_azure_error_message_falls_back_on_missing_field() {
+    let body = r#"{"error": {"code": "invalid_request"}}"#;
+    assert_eq!(parse_azure_error_message(body), body);
+}
+
 // --- map_azure_http_error ---
 
 #[test]
 fn test_map_azure_http_error_401_is_auth() {
-    assert!(matches!(map_azure_http_error(401, "unauthorized"), CloudError::Auth { .. }));
+    assert!(matches!(map_azure_http_error(401, "unauthorized", None), CloudError::Auth { .. }));
 }
 
 #[test]
 fn test_map_azure_http_error_403_is_auth() {
-    assert!(matches!(map_azure_http_error(403, "forbidden"), CloudError::Auth { .. }));
+    assert!(matches!(map_azure_http_error(403, "forbidden", None), CloudError::Auth { .. }));
 }
 
 #[test]
-fn test_map_azure_http_error_429_is_rate_limit() {
-    assert!(matches!(map_azure_http_error(429, "quota exceeded"), CloudError::RateLimit { .. }));
+fn test_map_azure_http_error_429_reads_retry_after() {
+    assert!(matches!(
+        map_azure_http_error(429, "quota exceeded", Some(30)),
+        CloudError::RateLimit { retry_after: Some(30) }
+    ));
+}
+
+#[test]
+fn test_map_azure_http_error_429_none_when_header_absent() {
+    assert!(matches!(
+        map_azure_http_error(429, "quota exceeded", None),
+        CloudError::RateLimit { retry_after: None }
+    ));
 }
 
 #[test]
 fn test_map_azure_http_error_400_is_not_retryable() {
     assert!(matches!(
-        map_azure_http_error(400, "bad request"),
+        map_azure_http_error(400, "bad request", None),
         CloudError::Provider { retryable: false, .. }
     ));
 }
@@ -252,7 +307,7 @@ fn test_map_azure_http_error_400_is_not_retryable() {
 #[test]
 fn test_map_azure_http_error_500_is_retryable() {
     assert!(matches!(
-        map_azure_http_error(500, "internal error"),
+        map_azure_http_error(500, "internal error", None),
         CloudError::Provider { retryable: true, .. }
     ));
 }
@@ -260,7 +315,7 @@ fn test_map_azure_http_error_500_is_retryable() {
 #[test]
 fn test_map_azure_http_error_503_is_retryable() {
     assert!(matches!(
-        map_azure_http_error(503, "unavailable"),
+        map_azure_http_error(503, "unavailable", None),
         CloudError::Provider { retryable: true, .. }
     ));
 }
@@ -268,7 +323,7 @@ fn test_map_azure_http_error_503_is_retryable() {
 #[test]
 fn test_map_azure_http_error_404_wildcard_not_retryable() {
     assert!(matches!(
-        map_azure_http_error(404, "not found"),
+        map_azure_http_error(404, "not found", None),
         CloudError::Provider { retryable: false, .. }
     ));
 }
@@ -390,6 +445,40 @@ fn test_drain_complete_lines_handles_multibyte_utf8_split_across_calls() {
     let parsed = drain_complete_lines(&mut buffer);
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0]["choices"][0]["delta"]["content"], "café");
+}
+
+// --- provider_error_from_response (no live credentials) ---
+
+#[tokio::test]
+async fn test_provider_error_from_response_maps_status_and_retry_after() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let body = r#"{"error": {"code": "429", "message": "Requests to this deployment exceeded the rate limit."}}"#;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut discard = [0u8; 1024];
+        let _ = socket.read(&mut discard).await;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 17\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/", addr))
+        .send()
+        .await
+        .unwrap();
+
+    let err = provider_error_from_response(response).await;
+    assert!(matches!(err, CloudError::RateLimit { retry_after: Some(17) }), "got {:?}", err);
 }
 
 // --- pump_stream edge cases (no live credentials) ---
