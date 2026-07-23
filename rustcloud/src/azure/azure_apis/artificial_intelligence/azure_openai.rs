@@ -316,24 +316,23 @@ pub(crate) fn sse_chunk_to_events(json: &serde_json::Value) -> Vec<LlmStreamEven
     events
 }
 
-async fn emit_chunk_events(
+pub(crate) async fn emit_chunk_events(
     events: Vec<LlmStreamEvent>,
     pending_done: &mut Option<LlmStreamEvent>,
     tx: &mut mpsc::Sender<LlmStreamEvent>,
 ) -> bool {
     let has_usage = events.iter().any(|e| matches!(e, LlmStreamEvent::Usage(_)));
 
-    if !has_usage {
-        if let Some(done) = pending_done.take() {
-            if tx.send(done).await.is_err() {
-                return false;
-            }
-        }
-    }
-
     for event in events {
         match event {
-            LlmStreamEvent::Done(_) => *pending_done = Some(event),
+            LlmStreamEvent::Done(_) => {
+                if let Some(previous) = pending_done.take() {
+                    if tx.send(previous).await.is_err() {
+                        return false;
+                    }
+                }
+                *pending_done = Some(event);
+            }
             other => {
                 if tx.send(other).await.is_err() {
                     return false;

@@ -66,6 +66,7 @@ All I/O is async (backed by Tokio), and errors are returned as the `CloudError` 
 
 | Category | Service |
 |---|---|
+| AI / ML | Bedrock (GenAI) |
 | Compute | EC2, ECS, EKS |
 | Database | DynamoDB |
 | Management | CloudWatch |
@@ -79,7 +80,7 @@ Examples: [`examples/aws/`](examples/aws/)
 
 | Category | Service |
 |---|---|
-| AI / ML | AutoML |
+| AI / ML | AutoML, Vertex AI (GenAI) |
 | App Services | Cloud Pub/Sub |
 | Compute | Compute Engine, GKE |
 | Database | Bigtable, BigQuery |
@@ -92,8 +93,11 @@ Examples: [`examples/gcp/`](examples/gcp/)
 
 | Category | Service |
 |---|---|
+| AI / ML | Azure OpenAI (GenAI) |
 | Auth | Azure authentication |
 | Storage | Blob Storage |
+
+Examples: [`examples/azure/`](examples/azure/)
 
 ### DigitalOcean *(in progress)*
 
@@ -177,6 +181,8 @@ export AZURE_CLIENT_ID="your-client-id"
 export AZURE_CLIENT_SECRET="your-client-secret"
 export AZURE_TENANT_ID="your-tenant-id"
 ```
+
+`AzureOpenAiProvider` is the one exception: it authenticates with a static API key instead of the service principal above. See [`examples/azure/artificial_intelligence/azure_openai.md`](examples/azure/artificial_intelligence/azure_openai.md#configure-credentials) for its `AZURE_OPENAI_*` variables.
 
 ### DigitalOcean
 

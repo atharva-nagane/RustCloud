@@ -68,7 +68,7 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ToolCallResponse {
     Text(LlmResponse),
     ToolCall {
