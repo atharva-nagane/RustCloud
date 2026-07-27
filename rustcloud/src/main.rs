@@ -9,6 +9,10 @@ pub mod traits {
     pub mod llm_provider;
     pub mod token_provider;
 }
+pub mod genai {
+    pub mod client;
+    pub mod routing;
+}
 pub mod azure{
     pub mod azure_apis{
         pub mod auth{
