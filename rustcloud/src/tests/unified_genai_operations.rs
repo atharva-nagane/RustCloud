@@ -5,7 +5,7 @@ use futures::{stream, StreamExt};
 
 use crate::errors::CloudError;
 use crate::genai::client::UnifiedLlmClient;
-use crate::genai::routing::{route_key_for_model, RoutingStrategy};
+use crate::genai::routing::{is_transient, route_key_for_model, RoutingStrategy};
 use crate::traits::llm_provider::{LlmProvider, LlmStream};
 use crate::types::llm::{
     EmbedResponse, FinishReason, LlmRequest, LlmResponse, LlmStreamEvent, Message, ModelRef,
@@ -19,6 +19,7 @@ enum MockBehavior {
     AuthError,
     RetryableProviderError,
     NonRetryableProviderError,
+    StreamErrorMidway,
 }
 
 struct MockProvider {
@@ -42,7 +43,7 @@ impl MockProvider {
 
     fn failure(&self) -> Option<CloudError> {
         match self.behavior {
-            MockBehavior::Ok => None,
+            MockBehavior::Ok | MockBehavior::StreamErrorMidway => None,
             MockBehavior::RateLimited => Some(CloudError::RateLimit {
                 retry_after: Some(1),
             }),
@@ -82,7 +83,12 @@ impl LlmProvider for MockProvider {
         if let Some(err) = self.failure() {
             return Err(err);
         }
-        let event = LlmStreamEvent::Done(FinishReason::Stop);
+        let event = match self.behavior {
+            MockBehavior::StreamErrorMidway => {
+                LlmStreamEvent::Error(CloudError::RateLimit { retry_after: None })
+            }
+            _ => LlmStreamEvent::Done(FinishReason::Stop),
+        };
         Ok(Box::pin(stream::once(async move { event })))
     }
 
@@ -436,24 +442,321 @@ fn test_route_key_case_insensitive() {
     }
 }
 
+#[test]
+fn test_is_transient_classifies_errors() {
+    assert!(is_transient(&CloudError::RateLimit { retry_after: None }));
+    assert!(is_transient(&CloudError::Provider {
+        http_status: 503,
+        message: "unavailable".to_string(),
+        retryable: true,
+    }));
+    assert!(!is_transient(&CloudError::Provider {
+        http_status: 400,
+        message: "bad request".to_string(),
+        retryable: false,
+    }));
+    assert!(!is_transient(&CloudError::Auth {
+        message: "denied".to_string(),
+    }));
+    assert!(!is_transient(&CloudError::Unsupported { feature: "tools" }));
+    assert!(!is_transient(&CloudError::Serialization {
+        source: serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+    }));
+}
+
 #[tokio::test]
-async fn test_fallback_currently_resolves_to_default() {
+async fn test_fallback_skips_rate_limited_provider() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let client = UnifiedLlmClient::builder()
-        .register("aws", MockProvider::new("aws", MockBehavior::Ok, calls.clone()))
+        .register("aws", MockProvider::new("aws", MockBehavior::RateLimited, calls.clone()))
         .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
-        .default_provider("azure")
         .routing(RoutingStrategy::Fallback)
         .build()
         .unwrap();
 
     let response = client
-        .generate(make_request(ModelRef::Provider("gpt-4o".to_string())))
+        .generate(make_request(ModelRef::Provider("test-model".to_string())))
         .await
         .unwrap();
 
     assert_eq!(response.text, "azure response");
-    assert_eq!(calls.lock().unwrap().as_slice(), ["azure"]);
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws", "azure"]);
+}
+
+#[tokio::test]
+async fn test_fallback_skips_retryable_provider_error() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register(
+            "aws",
+            MockProvider::new("aws", MockBehavior::RetryableProviderError, calls.clone()),
+        )
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let response = client
+        .generate(make_request(ModelRef::Provider("test-model".to_string())))
+        .await
+        .unwrap();
+
+    assert_eq!(response.text, "azure response");
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws", "azure"]);
+}
+
+#[tokio::test]
+async fn test_fallback_propagates_auth_immediately() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("aws", MockProvider::new("aws", MockBehavior::AuthError, calls.clone()))
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let result = client
+        .generate(make_request(ModelRef::Provider("test-model".to_string())))
+        .await;
+
+    assert!(matches!(result, Err(CloudError::Auth { .. })));
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws"]);
+}
+
+#[tokio::test]
+async fn test_fallback_propagates_non_retryable_immediately() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register(
+            "aws",
+            MockProvider::new("aws", MockBehavior::NonRetryableProviderError, calls.clone()),
+        )
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let result = client
+        .generate(make_request(ModelRef::Provider("test-model".to_string())))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(CloudError::Provider { retryable: false, .. })
+    ));
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws"]);
+}
+
+#[tokio::test]
+async fn test_fallback_all_rate_limit() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("aws", MockProvider::new("aws", MockBehavior::RateLimited, calls.clone()))
+        .register("gcp", MockProvider::new("gcp", MockBehavior::RateLimited, calls.clone()))
+        .register("azure", MockProvider::new("azure", MockBehavior::RateLimited, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let result = client
+        .generate(make_request(ModelRef::Provider("test-model".to_string())))
+        .await;
+
+    assert!(matches!(result, Err(CloudError::RateLimit { .. })));
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws", "gcp", "azure"]);
+}
+
+#[tokio::test]
+async fn test_fallback_respects_registration_order() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("gcp", MockProvider::new("gcp", MockBehavior::RateLimited, calls.clone()))
+        .register("aws", MockProvider::new("aws", MockBehavior::RateLimited, calls.clone()))
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    client
+        .generate(make_request(ModelRef::Provider("test-model".to_string())))
+        .await
+        .unwrap();
+
+    assert_eq!(calls.lock().unwrap().as_slice(), ["gcp", "aws", "azure"]);
+}
+
+#[tokio::test]
+async fn test_fallback_stream_initial_error_falls_back() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("aws", MockProvider::new("aws", MockBehavior::RateLimited, calls.clone()))
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let mut stream = client
+        .stream(make_request(ModelRef::Provider("test-model".to_string())))
+        .await
+        .unwrap();
+
+    let event = stream.next().await.expect("stream should yield one event");
+    assert!(matches!(event, LlmStreamEvent::Done(FinishReason::Stop)));
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws", "azure"]);
+}
+
+#[tokio::test]
+async fn test_fallback_stream_ignores_mid_stream_error() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register(
+            "aws",
+            MockProvider::new("aws", MockBehavior::StreamErrorMidway, calls.clone()),
+        )
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let mut stream = client
+        .stream(make_request(ModelRef::Provider("test-model".to_string())))
+        .await
+        .unwrap();
+
+    let event = stream.next().await.expect("stream should yield one event");
+    assert!(matches!(event, LlmStreamEvent::Error(_)));
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws"]);
+}
+
+#[test]
+fn test_provider_by_key_errors_for_unregistered_key() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("aws", MockProvider::new("aws", MockBehavior::Ok, calls))
+        .build()
+        .unwrap();
+
+    let result = client.provider_by_key("azure");
+
+    let Err(CloudError::Provider {
+        retryable, message, ..
+    }) = result
+    else {
+        panic!("expected a Provider error");
+    };
+    assert!(!retryable);
+    assert_eq!(message, "no provider registered under 'azure'");
+}
+
+#[test]
+fn test_resolve_errors_under_fallback_strategy() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("aws", MockProvider::new("aws", MockBehavior::Ok, calls))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let result = client.resolve(&ModelRef::Provider("test-model".to_string()));
+
+    assert!(matches!(
+        result,
+        Err(CloudError::Provider { retryable: false, .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_fallback_embed_skips_transient_provider() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register("aws", MockProvider::new("aws", MockBehavior::RateLimited, calls.clone()))
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let response = client.embed(vec!["hello".to_string()]).await.unwrap();
+
+    assert_eq!(response.embeddings.len(), 1);
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws", "azure"]);
+}
+
+#[tokio::test]
+async fn test_fallback_generate_with_tools_skips_transient_provider() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let client = UnifiedLlmClient::builder()
+        .register(
+            "aws",
+            MockProvider::new("aws", MockBehavior::RetryableProviderError, calls.clone()),
+        )
+        .register("azure", MockProvider::new("azure", MockBehavior::Ok, calls.clone()))
+        .routing(RoutingStrategy::Fallback)
+        .build()
+        .unwrap();
+
+    let tools = vec![ToolDefinition {
+        name: "tool".to_string(),
+        description: "desc".to_string(),
+        parameters: serde_json::json!({}),
+    }];
+    let result = client
+        .generate_with_tools(make_request(ModelRef::Provider("test-model".to_string())), tools)
+        .await
+        .unwrap();
+
+    assert!(matches!(result, ToolCallResponse::Text(response) if response.text == "azure response"));
+    assert_eq!(calls.lock().unwrap().as_slice(), ["aws", "azure"]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_unified_explicit_live() {
+    use crate::aws::aws_apis::artificial_intelligence::aws_bedrock::BedrockProvider;
+
+    let client = UnifiedLlmClient::builder()
+        .register("aws", BedrockProvider::new().await)
+        .default_provider("aws")
+        .routing(RoutingStrategy::Explicit)
+        .build()
+        .unwrap();
+
+    let response = client
+        .generate(make_request(ModelRef::Provider(
+            "anthropic.claude-3-5-haiku-20241022-v1:0".to_string(),
+        )))
+        .await
+        .unwrap();
+
+    assert!(!response.text.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_unified_model_based_live() {
+    use crate::aws::aws_apis::artificial_intelligence::aws_bedrock::BedrockProvider;
+    use crate::gcp::gcp_apis::artificial_intelligence::gcp_vertex_ai::VertexAiProvider;
+
+    let client = UnifiedLlmClient::builder()
+        .register("aws", BedrockProvider::new().await)
+        .register(
+            "gcp",
+            VertexAiProvider::new("your-project-id", "us-central1")
+                .await
+                .expect("failed to create provider"),
+        )
+        .default_provider("aws")
+        .routing(RoutingStrategy::ModelBased)
+        .build()
+        .unwrap();
+
+    let response = client
+        .generate(make_request(ModelRef::Provider(
+            "gemini-1.5-flash-001".to_string(),
+        )))
+        .await
+        .unwrap();
+
+    assert!(!response.text.is_empty());
 }
 
 #[tokio::test]

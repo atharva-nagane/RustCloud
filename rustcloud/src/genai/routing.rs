@@ -1,3 +1,4 @@
+use crate::errors::CloudError;
 use crate::types::llm::ModelRef;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7,7 +8,7 @@ pub enum RoutingStrategy {
     Fallback,
 }
 
-fn prefix_route_key(id: &str) -> Option<&'static str> {
+pub(crate) fn prefix_route_key(id: &str) -> Option<&'static str> {
     const AWS_PREFIXES: &[&str] = &["anthropic.", "amazon.", "meta.", "mistral."];
     const GCP_PREFIXES: &[&str] = &["gemini", "text-embedding-"];
     const AZURE_PREFIXES: &[&str] = &["gpt-", "o1", "o3"];
@@ -31,4 +32,13 @@ pub(crate) fn route_key_for_model(model: &ModelRef) -> Option<&'static str> {
         ModelRef::Provider(id) => prefix_route_key(id),
         ModelRef::Logical { family, .. } => prefix_route_key(family),
     }
+}
+
+pub(crate) fn is_transient(error: &CloudError) -> bool {
+    matches!(
+        error,
+        CloudError::RateLimit { .. }
+            | CloudError::Network { .. }
+            | CloudError::Provider { retryable: true, .. }
+    )
 }

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::future::Future;
 
 use async_trait::async_trait;
 
 use crate::errors::CloudError;
-use crate::genai::routing::{route_key_for_model, RoutingStrategy};
+use crate::genai::routing::{is_transient, route_key_for_model, RoutingStrategy};
 use crate::traits::llm_provider::{LlmProvider, LlmStream};
 use crate::types::llm::{
     EmbedResponse, LlmRequest, LlmResponse, ModelRef, ToolCallResponse, ToolDefinition,
@@ -21,7 +22,7 @@ impl UnifiedLlmClient {
         UnifiedLlmClientBuilder::new()
     }
 
-    fn provider_by_key(&self, key: &str) -> Result<&dyn LlmProvider, CloudError> {
+    pub(crate) fn provider_by_key(&self, key: &str) -> Result<&dyn LlmProvider, CloudError> {
         let index = *self.index.get(key).ok_or_else(|| CloudError::Provider {
             http_status: 0,
             message: format!("no provider registered under '{}'", key),
@@ -30,16 +31,58 @@ impl UnifiedLlmClient {
         Ok(self.providers[index].1.as_ref())
     }
 
-    fn resolve(&self, model: &ModelRef) -> Result<&dyn LlmProvider, CloudError> {
+    pub(crate) fn resolve(&self, model: &ModelRef) -> Result<&dyn LlmProvider, CloudError> {
         match self.routing {
             RoutingStrategy::ModelBased => match route_key_for_model(model) {
                 Some(key) => self.provider_by_key(key),
                 None => self.provider_by_key(&self.default_provider),
             },
-            RoutingStrategy::Explicit | RoutingStrategy::Fallback => {
-                self.provider_by_key(&self.default_provider)
+            RoutingStrategy::Explicit => self.provider_by_key(&self.default_provider),
+            RoutingStrategy::Fallback => Err(CloudError::Provider {
+                http_status: 0,
+                message: "fallback routing does not resolve to a single provider; call fallback_with instead"
+                    .to_string(),
+                retryable: false,
+            }),
+        }
+    }
+
+    pub(crate) async fn fallback_with<'a, T, F, Fut>(&'a self, call: F) -> Result<T, CloudError>
+    where
+        F: Fn(&'a dyn LlmProvider) -> Fut,
+        Fut: Future<Output = Result<T, CloudError>>,
+    {
+        let mut last_error = None;
+        for (_, provider) in &self.providers {
+            match call(provider.as_ref()).await {
+                Ok(value) => return Ok(value),
+                Err(err) if is_transient(&err) => last_error = Some(err),
+                Err(err) => return Err(err),
             }
         }
+        Err(last_error.expect("build() guarantees at least one registered provider"))
+    }
+
+    pub(crate) async fn fallback_generate(&self, req: LlmRequest) -> Result<LlmResponse, CloudError> {
+        self.fallback_with(|p| p.generate(req.clone())).await
+    }
+
+    // fallback only covers the initial call, not mid-stream errors — the caller already owns the stream by then
+    pub(crate) async fn fallback_stream(&self, req: LlmRequest) -> Result<LlmStream, CloudError> {
+        self.fallback_with(|p| p.stream(req.clone())).await
+    }
+
+    pub(crate) async fn fallback_embed(&self, texts: Vec<String>) -> Result<EmbedResponse, CloudError> {
+        self.fallback_with(|p| p.embed(texts.clone())).await
+    }
+
+    pub(crate) async fn fallback_generate_with_tools(
+        &self,
+        req: LlmRequest,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<ToolCallResponse, CloudError> {
+        self.fallback_with(|p| p.generate_with_tools(req.clone(), tools.clone()))
+            .await
     }
 }
 
@@ -117,14 +160,23 @@ impl UnifiedLlmClientBuilder {
 #[async_trait]
 impl LlmProvider for UnifiedLlmClient {
     async fn generate(&self, req: LlmRequest) -> Result<LlmResponse, CloudError> {
+        if self.routing == RoutingStrategy::Fallback {
+            return self.fallback_generate(req).await;
+        }
         self.resolve(&req.model)?.generate(req).await
     }
 
     async fn stream(&self, req: LlmRequest) -> Result<LlmStream, CloudError> {
+        if self.routing == RoutingStrategy::Fallback {
+            return self.fallback_stream(req).await;
+        }
         self.resolve(&req.model)?.stream(req).await
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<EmbedResponse, CloudError> {
+        if self.routing == RoutingStrategy::Fallback {
+            return self.fallback_embed(texts).await;
+        }
         self.provider_by_key(&self.default_provider)?
             .embed(texts)
             .await
@@ -135,6 +187,9 @@ impl LlmProvider for UnifiedLlmClient {
         req: LlmRequest,
         tools: Vec<ToolDefinition>,
     ) -> Result<ToolCallResponse, CloudError> {
+        if self.routing == RoutingStrategy::Fallback {
+            return self.fallback_generate_with_tools(req, tools).await;
+        }
         self.resolve(&req.model)?
             .generate_with_tools(req, tools)
             .await
