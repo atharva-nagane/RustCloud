@@ -9,10 +9,13 @@ pub mod traits {
     pub mod llm_provider;
     pub mod token_provider;
 }
+
 pub mod genai {
     pub mod client;
+    pub mod retry;
     pub mod routing;
 }
+
 pub mod azure{
     pub mod azure_apis{
         pub mod auth{
@@ -108,3 +111,4 @@ pub mod digiocean {
 fn main() {
     println!("Hello, world!");
 }
+
