@@ -68,14 +68,34 @@ impl<P: LlmProvider> LlmProvider for RetryMiddleware<P> {
         }
     }
 
-    // stream/embed/generate_with_tools stay plain passthroughs until a follow-up wires them
-    // up the same way as generate() above; scoping this PR to one method keeps the diff reviewable
+    // retries only the initial call — once a stream is handed back it's already partially
+    // consumed, so a mid-stream error surfaces as an event instead of triggering a hidden replay
     async fn stream(&self, req: LlmRequest) -> Result<LlmStream, CloudError> {
-        self.inner.stream(req).await
+        let mut attempt = 0;
+        loop {
+            match self.inner.stream(req.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) if attempt < self.max_retries && is_transient(&err) => {
+                    sleep(self.delay_for(&err, attempt)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<EmbedResponse, CloudError> {
-        self.inner.embed(texts).await
+        let mut attempt = 0;
+        loop {
+            match self.inner.embed(texts.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(err) if attempt < self.max_retries && is_transient(&err) => {
+                    sleep(self.delay_for(&err, attempt)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     async fn generate_with_tools(
@@ -83,6 +103,20 @@ impl<P: LlmProvider> LlmProvider for RetryMiddleware<P> {
         req: LlmRequest,
         tools: Vec<ToolDefinition>,
     ) -> Result<ToolCallResponse, CloudError> {
-        self.inner.generate_with_tools(req, tools).await
+        let mut attempt = 0;
+        loop {
+            match self
+                .inner
+                .generate_with_tools(req.clone(), tools.clone())
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(err) if attempt < self.max_retries && is_transient(&err) => {
+                    sleep(self.delay_for(&err, attempt)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
