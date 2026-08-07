@@ -140,25 +140,24 @@ pub(crate) fn build_tool_request(
     body
 }
 
-pub(crate) fn map_azure_http_error(status: u16, body: &str) -> CloudError {
+pub(crate) fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.parse().ok()
+}
+
+pub(crate) fn parse_azure_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| body.trim().to_owned())
+}
+
+pub(crate) fn map_azure_http_error(status: u16, body: &str, retry_after: Option<u64>) -> CloudError {
+    let message = parse_azure_error_message(body);
     match status {
-        401 | 403 => CloudError::Auth { message: body.to_string() },
-        429 => CloudError::RateLimit { retry_after: None },
-        400 => CloudError::Provider {
-            http_status: 400,
-            message: body.to_string(),
-            retryable: false,
-        },
-        500 | 503 => CloudError::Provider {
-            http_status: status,
-            message: body.to_string(),
-            retryable: true,
-        },
-        _ => CloudError::Provider {
-            http_status: status,
-            message: body.to_string(),
-            retryable: status >= 500,
-        },
+        401 | 403 => CloudError::Auth { message },
+        429 => CloudError::RateLimit { retry_after },
+        400 => CloudError::Provider { http_status: 400, message, retryable: false },
+        _ => CloudError::Provider { http_status: status, message, retryable: status >= 500 },
     }
 }
 
@@ -317,24 +316,23 @@ pub(crate) fn sse_chunk_to_events(json: &serde_json::Value) -> Vec<LlmStreamEven
     events
 }
 
-async fn emit_chunk_events(
+pub(crate) async fn emit_chunk_events(
     events: Vec<LlmStreamEvent>,
     pending_done: &mut Option<LlmStreamEvent>,
     tx: &mut mpsc::Sender<LlmStreamEvent>,
 ) -> bool {
     let has_usage = events.iter().any(|e| matches!(e, LlmStreamEvent::Usage(_)));
 
-    if !has_usage {
-        if let Some(done) = pending_done.take() {
-            if tx.send(done).await.is_err() {
-                return false;
-            }
-        }
-    }
-
     for event in events {
         match event {
-            LlmStreamEvent::Done(_) => *pending_done = Some(event),
+            LlmStreamEvent::Done(_) => {
+                if let Some(previous) = pending_done.take() {
+                    if tx.send(previous).await.is_err() {
+                        return false;
+                    }
+                }
+                *pending_done = Some(event);
+            }
             other => {
                 if tx.send(other).await.is_err() {
                     return false;
@@ -352,6 +350,13 @@ async fn emit_chunk_events(
     }
 
     true
+}
+
+pub(crate) async fn provider_error_from_response(response: reqwest::Response) -> CloudError {
+    let status = response.status().as_u16();
+    let retry_after = retry_after_seconds(response.headers());
+    let text = response.text().await.unwrap_or_default();
+    map_azure_http_error(status, &text, retry_after)
 }
 
 pub(crate) async fn pump_stream(mut response: reqwest::Response, mut tx: mpsc::Sender<LlmStreamEvent>) {
@@ -406,10 +411,8 @@ impl LlmProvider for AzureOpenAiProvider {
             .await
             .map_err(|e| CloudError::Network { source: e })?;
 
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let text = response.text().await.unwrap_or_default();
-            return Err(map_azure_http_error(status, &text));
+        if response.status().as_u16() >= 400 {
+            return Err(provider_error_from_response(response).await);
         }
 
         let bytes = response
@@ -437,10 +440,8 @@ impl LlmProvider for AzureOpenAiProvider {
             .await
             .map_err(|e| CloudError::Network { source: e })?;
 
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let text = response.text().await.unwrap_or_default();
-            return Err(map_azure_http_error(status, &text));
+        if response.status().as_u16() >= 400 {
+            return Err(provider_error_from_response(response).await);
         }
 
         let (tx, rx) = mpsc::channel::<LlmStreamEvent>(32);
@@ -464,10 +465,8 @@ impl LlmProvider for AzureOpenAiProvider {
             .await
             .map_err(|e| CloudError::Network { source: e })?;
 
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let text = response.text().await.unwrap_or_default();
-            return Err(map_azure_http_error(status, &text));
+        if response.status().as_u16() >= 400 {
+            return Err(provider_error_from_response(response).await);
         }
 
         let bytes = response
@@ -503,10 +502,8 @@ impl LlmProvider for AzureOpenAiProvider {
             .await
             .map_err(|e| CloudError::Network { source: e })?;
 
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let text = response.text().await.unwrap_or_default();
-            return Err(map_azure_http_error(status, &text));
+        if response.status().as_u16() >= 400 {
+            return Err(provider_error_from_response(response).await);
         }
 
         let bytes = response

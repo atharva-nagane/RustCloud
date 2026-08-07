@@ -22,3 +22,5 @@ mod gcp_loadbalancer_operations;
 mod gcp_notification_operations;
 mod gcp_storage_operations;
 mod gcp_vertex_ai_operations;
+mod retry_middleware_operations;
+mod unified_genai_operations;

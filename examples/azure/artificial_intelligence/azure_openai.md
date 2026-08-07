@@ -157,6 +157,46 @@ async fn main() {
 
 `generate_with_tools` requires at least one tool; an empty list returns `CloudError::Unsupported` instead of making a request. When the model calls a tool, Azure sends its arguments as a JSON-encoded string, which is parsed back into a `serde_json::Value` before being returned.
 
+## Common errors
+
+```rust
+use rustcloud::azure::azure_apis::artificial_intelligence::azure_openai::AzureOpenAiProvider;
+use rustcloud::errors::CloudError;
+use rustcloud::traits::llm_provider::LlmProvider;
+use rustcloud::types::llm::{LlmRequest, Message, ModelRef};
+
+#[tokio::main]
+async fn main() {
+    let provider = AzureOpenAiProvider::new().expect("failed to load Azure OpenAI credentials");
+
+    let req = LlmRequest {
+        model: ModelRef::Deployment("gpt-4o".to_string()),
+        messages: vec![Message { role: "user".to_string(), content: "hi".to_string() }],
+        max_tokens: Some(64),
+        temperature: Some(0.0),
+        system_prompt: None,
+    };
+
+    match provider.generate(req).await {
+        Ok(resp) => println!("{}", resp.text),
+        Err(CloudError::Auth { message }) => eprintln!("auth failed: {message}"),
+        Err(CloudError::RateLimit { retry_after }) => {
+            eprintln!("rate limited, retry after {:?}s", retry_after)
+        }
+        Err(CloudError::Provider { http_status, message, retryable }) => {
+            eprintln!("provider error {http_status} (retryable: {retryable}): {message}")
+        }
+        Err(e) => eprintln!("request failed: {:?}", e),
+    }
+}
+```
+
+- **Invalid API key** — Azure returns 401/403 with a JSON error body. `AzureOpenAiProvider` maps this to `CloudError::Auth`, and the `message` field is the human-readable text Azure sent (e.g. "The api-key you provided is invalid."), not the raw JSON blob.
+- **Rate limited (429)** — mapped to `CloudError::RateLimit { retry_after }`. When Azure includes a `Retry-After` header, `retry_after` is `Some(seconds)`; otherwise it's `None`.
+- **Prompt-level content filter** — a prompt rejected by Azure's content filter comes back as HTTP 400 with `"code": "content_filter"` in the error body. This maps to `CloudError::Provider { http_status: 400, retryable: false, .. }`, since resubmitting the same prompt unmodified will fail the same way.
+- **Response-level content filter** — this is not an error. Azure returns HTTP 200 with the message `content` set to `null` and `finish_reason: "content_filter"`. `generate` returns `Ok(LlmResponse { text: "".to_string(), finish_reason: FinishReason::Other("content_filter".to_string()), .. })`, and `stream` emits a matching `LlmStreamEvent::Done(FinishReason::Other("content_filter".to_string()))`. Check `finish_reason` if you need to tell a filtered response apart from a genuinely empty one.
+- **Mid-stream error** — a `stream()` call can succeed initially and still fail partway through, if Azure sends a `data: {"error": {...}}` SSE chunk after generation has already started. This surfaces as `LlmStreamEvent::Error(CloudError::Provider { http_status: 200, .. })` from the stream itself, not as an `Err` from the initial `.await`. Check for the `Error` variant while iterating the stream, not just at the call site.
+
 ## ModelRef semantics
 
 - `ModelRef::Deployment(name)` — used as-is as the Azure deployment name. This is the native way to address an Azure OpenAI resource.

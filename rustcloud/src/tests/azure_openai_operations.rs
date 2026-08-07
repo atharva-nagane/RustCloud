@@ -6,15 +6,19 @@ use crate::azure::azure_apis::artificial_intelligence::azure_openai::{
     build_embed_request,
     build_tool_request,
     drain_complete_lines,
+    emit_chunk_events,
     extract_deployment_name,
     is_reasoning_model,
     map_azure_http_error,
     map_finish_reason,
+    parse_azure_error_message,
     parse_chat_response,
     parse_embed_response,
     parse_sse_line,
     parse_tool_response,
+    provider_error_from_response,
     pump_stream,
+    retry_after_seconds,
     sse_chunk_to_events,
 };
 use crate::errors::CloudError;
@@ -69,6 +73,15 @@ fn test_azure_endpoint_trims_trailing_slash() {
         url,
         "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
     );
+}
+
+// --- request ---
+
+#[test]
+fn test_request_sets_api_key_header() {
+    let provider = no_creds_provider();
+    let built = provider.request("https://my-resource.openai.azure.com/").build().unwrap();
+    assert_eq!(built.headers().get("api-key").unwrap(), "fake-key");
 }
 
 // --- extract_deployment_name ---
@@ -128,6 +141,38 @@ fn test_build_chat_request_omits_unset_params() {
 }
 
 #[test]
+fn test_build_chat_request_system_only_no_messages() {
+    let mut req = make_request(ModelRef::Deployment("gpt-4o".to_string()), vec![]);
+    req.system_prompt = Some("You are a helpful assistant.".to_string());
+    let body = build_chat_request(&req, "gpt-4o");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "You are a helpful assistant.");
+}
+
+#[test]
+fn test_build_chat_request_preserves_multi_turn_order() {
+    let req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![
+            Message { role: "user".to_string(), content: "first".to_string() },
+            Message { role: "assistant".to_string(), content: "second".to_string() },
+            Message { role: "user".to_string(), content: "third".to_string() },
+        ],
+    );
+    let body = build_chat_request(&req, "gpt-4o");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "first");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "second");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"], "third");
+}
+
+#[test]
 fn test_is_reasoning_model_o1_o3() {
     assert!(is_reasoning_model("o1-mini"));
     assert!(is_reasoning_model("o3"));
@@ -177,7 +222,7 @@ fn test_map_finish_reason_tool_calls() {
 }
 
 #[test]
-fn test_map_finish_reason_other() {
+fn test_map_finish_reason_content_filter() {
     let r = map_finish_reason("content_filter");
     assert!(matches!(r, FinishReason::Other(s) if s == "content_filter"));
 }
@@ -224,27 +269,92 @@ fn test_parse_chat_response_no_usage() {
     assert!(resp.usage.is_none());
 }
 
+#[test]
+fn test_parse_chat_response_null_content_filtered() {
+    let json = serde_json::json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": null },
+            "finish_reason": "content_filter"
+        }]
+    });
+    let resp = parse_chat_response(&json).unwrap();
+    assert_eq!(resp.text, "");
+    assert!(matches!(resp.finish_reason, FinishReason::Other(s) if s == "content_filter"));
+}
+
+// --- retry_after_seconds ---
+
+#[test]
+fn test_retry_after_seconds_parses_header() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+    assert_eq!(retry_after_seconds(&headers), Some(30));
+}
+
+#[test]
+fn test_retry_after_seconds_absent() {
+    let headers = reqwest::header::HeaderMap::new();
+    assert_eq!(retry_after_seconds(&headers), None);
+}
+
+#[test]
+fn test_retry_after_seconds_non_numeric_returns_none() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+    assert_eq!(retry_after_seconds(&headers), None);
+}
+
+// --- parse_azure_error_message ---
+
+#[test]
+fn test_parse_azure_error_message_extracts_field() {
+    let body = r#"{"error": {"code": "invalid_request", "message": "The api-key you provided is invalid."}}"#;
+    assert_eq!(parse_azure_error_message(body), "The api-key you provided is invalid.");
+}
+
+#[test]
+fn test_parse_azure_error_message_falls_back_on_non_json() {
+    assert_eq!(parse_azure_error_message("  not json at all  "), "not json at all");
+}
+
+#[test]
+fn test_parse_azure_error_message_falls_back_on_missing_field() {
+    let body = r#"{"error": {"code": "invalid_request"}}"#;
+    assert_eq!(parse_azure_error_message(body), body);
+}
+
 // --- map_azure_http_error ---
 
 #[test]
 fn test_map_azure_http_error_401_is_auth() {
-    assert!(matches!(map_azure_http_error(401, "unauthorized"), CloudError::Auth { .. }));
+    assert!(matches!(map_azure_http_error(401, "unauthorized", None), CloudError::Auth { .. }));
 }
 
 #[test]
 fn test_map_azure_http_error_403_is_auth() {
-    assert!(matches!(map_azure_http_error(403, "forbidden"), CloudError::Auth { .. }));
+    assert!(matches!(map_azure_http_error(403, "forbidden", None), CloudError::Auth { .. }));
 }
 
 #[test]
-fn test_map_azure_http_error_429_is_rate_limit() {
-    assert!(matches!(map_azure_http_error(429, "quota exceeded"), CloudError::RateLimit { .. }));
+fn test_map_azure_http_error_429_reads_retry_after() {
+    assert!(matches!(
+        map_azure_http_error(429, "quota exceeded", Some(30)),
+        CloudError::RateLimit { retry_after: Some(30) }
+    ));
+}
+
+#[test]
+fn test_map_azure_http_error_429_none_when_header_absent() {
+    assert!(matches!(
+        map_azure_http_error(429, "quota exceeded", None),
+        CloudError::RateLimit { retry_after: None }
+    ));
 }
 
 #[test]
 fn test_map_azure_http_error_400_is_not_retryable() {
     assert!(matches!(
-        map_azure_http_error(400, "bad request"),
+        map_azure_http_error(400, "bad request", None),
         CloudError::Provider { retryable: false, .. }
     ));
 }
@@ -252,7 +362,7 @@ fn test_map_azure_http_error_400_is_not_retryable() {
 #[test]
 fn test_map_azure_http_error_500_is_retryable() {
     assert!(matches!(
-        map_azure_http_error(500, "internal error"),
+        map_azure_http_error(500, "internal error", None),
         CloudError::Provider { retryable: true, .. }
     ));
 }
@@ -260,7 +370,7 @@ fn test_map_azure_http_error_500_is_retryable() {
 #[test]
 fn test_map_azure_http_error_503_is_retryable() {
     assert!(matches!(
-        map_azure_http_error(503, "unavailable"),
+        map_azure_http_error(503, "unavailable", None),
         CloudError::Provider { retryable: true, .. }
     ));
 }
@@ -268,7 +378,7 @@ fn test_map_azure_http_error_503_is_retryable() {
 #[test]
 fn test_map_azure_http_error_404_wildcard_not_retryable() {
     assert!(matches!(
-        map_azure_http_error(404, "not found"),
+        map_azure_http_error(404, "not found", None),
         CloudError::Provider { retryable: false, .. }
     ));
 }
@@ -348,6 +458,16 @@ fn test_sse_chunk_finish_emits_usage_then_done() {
 }
 
 #[test]
+fn test_sse_chunk_content_filter_finish() {
+    let json = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "content_filter" }]
+    });
+    let events = sse_chunk_to_events(&json);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], LlmStreamEvent::Done(FinishReason::Other(s)) if s == "content_filter"));
+}
+
+#[test]
 fn test_sse_chunk_error_object() {
     let json = serde_json::json!({
         "error": { "message": "content filtered", "code": "content_filter" }
@@ -390,6 +510,94 @@ fn test_drain_complete_lines_handles_multibyte_utf8_split_across_calls() {
     let parsed = drain_complete_lines(&mut buffer);
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0]["choices"][0]["delta"]["content"], "café");
+}
+
+// --- provider_error_from_response (no live credentials) ---
+
+#[tokio::test]
+async fn test_provider_error_from_response_maps_status_and_retry_after() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let body = r#"{"error": {"code": "429", "message": "Requests to this deployment exceeded the rate limit."}}"#;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut discard = [0u8; 1024];
+        let _ = socket.read(&mut discard).await;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 17\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/", addr))
+        .send()
+        .await
+        .unwrap();
+
+    let err = provider_error_from_response(response).await;
+    assert!(matches!(err, CloudError::RateLimit { retry_after: Some(17) }), "got {:?}", err);
+}
+
+// --- emit_chunk_events (direct, no live credentials) ---
+
+#[tokio::test]
+async fn test_emit_chunk_events_does_not_reorder_content_after_pending_done() {
+    let (mut tx, mut rx) = futures::channel::mpsc::channel::<LlmStreamEvent>(32);
+    let mut pending_done: Option<LlmStreamEvent> = None;
+
+    let ok = emit_chunk_events(vec![LlmStreamEvent::Done(FinishReason::Stop)], &mut pending_done, &mut tx).await;
+    assert!(ok);
+    assert!(pending_done.is_some(), "Done should be buffered, not sent yet");
+
+    let ok = emit_chunk_events(
+        vec![LlmStreamEvent::DeltaText("oops".to_string())],
+        &mut pending_done,
+        &mut tx,
+    )
+    .await;
+    assert!(ok);
+
+    drop(tx);
+    let mut received = Vec::new();
+    while let Some(event) = rx.next().await {
+        received.push(event);
+    }
+
+    assert_eq!(received.len(), 1);
+    assert!(matches!(&received[0], LlmStreamEvent::DeltaText(t) if t == "oops"));
+    assert!(
+        pending_done.is_some(),
+        "the buffered Done must not jump ahead of unrelated content"
+    );
+}
+
+#[tokio::test]
+async fn test_emit_chunk_events_flushes_prior_done_before_storing_new_one() {
+    let (mut tx, mut rx) = futures::channel::mpsc::channel::<LlmStreamEvent>(32);
+    let mut pending_done: Option<LlmStreamEvent> = None;
+
+    let ok = emit_chunk_events(vec![LlmStreamEvent::Done(FinishReason::Stop)], &mut pending_done, &mut tx).await;
+    assert!(ok);
+    let ok = emit_chunk_events(vec![LlmStreamEvent::Done(FinishReason::Length)], &mut pending_done, &mut tx).await;
+    assert!(ok);
+
+    drop(tx);
+    let mut received = Vec::new();
+    while let Some(event) = rx.next().await {
+        received.push(event);
+    }
+
+    assert_eq!(received.len(), 1, "the first Done must be flushed, not silently dropped");
+    assert!(matches!(&received[0], LlmStreamEvent::Done(FinishReason::Stop)));
+    assert!(matches!(pending_done, Some(LlmStreamEvent::Done(FinishReason::Length))));
 }
 
 // --- pump_stream edge cases (no live credentials) ---
@@ -503,6 +711,44 @@ async fn test_stream_orders_usage_before_done_across_separate_chunks() {
     assert_eq!(events.len(), 2);
     assert!(matches!(&events[0], LlmStreamEvent::Usage(u) if u.prompt_tokens == 5 && u.completion_tokens == 10));
     assert!(matches!(&events[1], LlmStreamEvent::Done(FinishReason::Stop)));
+}
+
+#[tokio::test]
+async fn test_stream_flushes_pending_done_on_clean_close_without_usage() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // server closes right after finish_reason; no stream_options usage chunk ever arrives
+    let body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n";
+    let body_len = body.len();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut discard = [0u8; 1024];
+        let _ = socket.read(&mut discard).await;
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body_len, body);
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/", addr))
+        .send()
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = futures::channel::mpsc::channel::<LlmStreamEvent>(32);
+    pump_stream(response, tx).await;
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.next().await {
+        events.push(event);
+    }
+
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], LlmStreamEvent::Done(FinishReason::Stop)));
 }
 
 // --- build_embed_request ---
@@ -770,6 +1016,28 @@ async fn test_generate_live() {
     };
     let resp = provider.generate(req).await.expect("generate failed");
     assert!(!resp.text.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_generate_live_invalid_key() {
+    let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT").expect("AZURE_OPENAI_ENDPOINT not set");
+    let provider = AzureOpenAiProvider::with_http_client(
+        reqwest::Client::new(),
+        endpoint,
+        "invalid-key",
+        "2024-10-21",
+        "",
+    );
+    let req = make_request(
+        ModelRef::Deployment("gpt-4o".to_string()),
+        vec![Message { role: "user".to_string(), content: "hi".to_string() }],
+    );
+    let err = provider.generate(req).await.expect_err("expected an auth error with an invalid key");
+    match err {
+        CloudError::Auth { message } => assert!(!message.is_empty()),
+        other => panic!("expected CloudError::Auth, got {:?}", other),
+    }
 }
 
 #[tokio::test]
